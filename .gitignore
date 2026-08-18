@@ -1,0 +1,44 @@
+# =============================================================================
+# Terraform
+# =============================================================================
+
+# Provider binaries and module cache. `terraform init` puts ~674MB here.
+.terraform/
+
+# State. Treat state as a CREDENTIAL STORE, not just config: aws_db_instance
+# password lands in it in cleartext and no arrangement of random_password
+# avoids that. State belongs in the encrypted, versioned S3 backend — never
+# in git.
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+
+# Variable files. The most likely place for someone to park a real credential.
+# Commit *.tfvars.example instead, with placeholder values.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Crash logs may contain variable values, including secrets.
+crash.log
+crash.*.log
+
+# Local CLI overrides.
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Child modules do not consume a lock file — the ROOT module's lock governs
+# provider versions. Roots live in each engineer's individual repo, where the
+# lock file SHOULD be committed.
+modules/**/.terraform.lock.hcl
+
+# =============================================================================
+# Tooling / OS
+# =============================================================================
+.DS_Store
+*.log
+!evidence/**/*.log
