@@ -1,114 +1,81 @@
 # =============================================================================
 # modules/data — inputs
 #
-# Defaults match the sizes the assignment specifies, so a caller that passes
-# nothing still gets a correctly right-sized instance. Every default is
-# justified in README.md rather than left as a magic number.
+# The connection details come from the Aiven service page and are supplied as
+# TF_VAR_db_* environment variables sourced from GitHub Actions secrets. There
+# are deliberately no defaults for host/username/password: a default credential
+# is worse than a missing one, because a missing one fails loudly at plan time.
 # =============================================================================
 
-variable "identifier" {
-  description = "RDS instance identifier. Distinct per caller so two roots can share the platform."
+variable "db_host" {
+  description = "Aiven MySQL hostname, e.g. mysql-xxxx-yyyy.a.aivencloud.com. From the service page, never committed."
   type        = string
-  default     = "regional-health-mysql"
+
+  validation {
+    condition     = length(trimspace(var.db_host)) > 0
+    error_message = "db_host must be set. Supply it as TF_VAR_db_host from a GitHub Actions secret or your local environment."
+  }
 }
 
-variable "db_name" {
-  description = "Name of the initial database created on the instance."
-  type        = string
-  default     = "capacity_lab"
+variable "db_port" {
+  description = <<-EOT
+    Aiven MySQL port. NOT 3306 — Aiven assigns a high port per service, so this
+    has no default on purpose. Copy it from the service page.
+  EOT
+  type        = number
+
+  validation {
+    condition     = var.db_port > 0 && var.db_port <= 65535
+    error_message = "db_port must be a valid TCP port (1-65535). Aiven assigns a high port per service; check the service page rather than assuming 3306."
+  }
 }
 
 variable "db_username" {
-  description = "Master username for the MySQL instance. The password is generated, never supplied."
+  description = "MySQL username. Aiven's default is avnadmin."
   type        = string
-  default     = "app"
+  default     = "avnadmin"
+}
+
+variable "db_password" {
+  description = <<-EOT
+    MySQL password, generated and owned by Aiven.
+
+    Marked sensitive, which keeps it out of plan output and CLI logs. It does NOT
+    keep it out of Terraform state — the provider must store the value it sent to
+    the API. Treat the state backend as a credential store: encrypted, versioned,
+    non-public.
+
+    Supply as TF_VAR_db_password. Never in a committed tfvars file.
+  EOT
+  type        = string
+  sensitive   = true
 
   validation {
-    # RDS reserves 'admin' and MySQL reserves a few others; catching it here
-    # fails at plan time instead of after a two-minute create.
-    condition     = !contains(["admin", "root", "mysql", "guest"], lower(var.db_username))
-    error_message = "db_username must not be a MySQL/RDS reserved name (admin, root, mysql, guest)."
+    condition     = length(var.db_password) > 0
+    error_message = "db_password must be set. Supply it as TF_VAR_db_password from a GitHub Actions secret or your local environment."
   }
 }
 
-variable "instance_class" {
-  description = "RDS instance class. db.t3.micro (2 vCPU / 1 GiB) is ample for a 10k-row dataset."
+variable "db_name" {
+  description = "Database name. Aiven's default is defaultdb; the lab schema can live there or in a database you create."
   type        = string
-  default     = "db.t3.micro"
-}
-
-variable "allocated_storage" {
-  description = "Storage in GiB. 20 is the RDS-MySQL minimum; the dataset is a few MB."
-  type        = number
-  default     = 20
-
-  validation {
-    condition     = var.allocated_storage >= 20
-    error_message = "RDS MySQL requires at least 20 GiB of allocated storage."
-  }
-}
-
-variable "engine_version" {
-  description = "MySQL engine version. 8.0 matches Assignment 1, so InnoDB lock behaviour is comparable."
-  type        = string
-  default     = "8.0"
+  default     = "defaultdb"
 }
 
 variable "secret_name" {
-  description = "Secrets Manager secret name holding the DB credential envelope."
+  description = "Secrets Manager secret name holding the credential envelope."
   type        = string
   default     = "regional-health/db"
 }
 
-variable "multi_az" {
-  description = <<-EOT
-    Multi-AZ deployment. Defaults to false for the lab: it halves cost and
-    LocalStack does not emulate AZ failover anyway. The trade-off being
-    accepted is that a single AZ loss takes the database down entirely, with
-    recovery bounded by restore-from-backup rather than by failover.
-  EOT
-  type        = bool
-  default     = false
-}
-
-variable "storage_encrypted" {
-  description = <<-EOT
-    Encryption at rest. Defaults true because `trivy config` requires it and it
-    is correct on real AWS. NOTE: LocalStack returns this attribute as
-    configured but applies no encryption — recorded in FIDELITY.md.
-  EOT
-  type        = bool
-  default     = true
-}
-
-variable "backup_retention_period" {
-  description = <<-EOT
-    Days of automated backups. 7 satisfies `trivy config` and is a defensible
-    production floor. LocalStack does not actually take backups.
-  EOT
-  type        = number
-  default     = 7
-}
-
-variable "deletion_protection" {
-  description = <<-EOT
-    Deliberately false. The graded evidence requires `terraform destroy` to
-    succeed (evidence/01-iac/destroy.log) and CI recreates the stack from zero
-    on every run. On a real production database this MUST be true — the
-    divergence is stated here rather than hidden.
-  EOT
-  type        = bool
-  default     = false
-}
-
 variable "kms_key_id" {
-  description = "Optional CMK ARN for RDS storage and the secret. Null uses the AWS-managed key."
+  description = "Optional CMK ARN for the secret. Null uses the AWS-managed key. LocalStack accepts this but enforces nothing — a FIDELITY.md candidate."
   type        = string
   default     = null
 }
 
 variable "tags" {
-  description = "Tags applied to every resource in this module."
+  description = "Tags applied to the secret."
   type        = map(string)
   default     = {}
 }

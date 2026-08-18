@@ -1,7 +1,15 @@
-# `modules/data` — RDS MySQL 8.0 + Secrets Manager
+# `modules/data` — publish external MySQL credentials to Secrets Manager
 
-Creates a managed MySQL instance and publishes its credentials to Secrets
-Manager using the envelope the application expects.
+The database is **Aiven for MySQL** — a real managed MySQL living outside this
+Terraform. RDS was dropped because it is not on LocalStack's free tier.
+
+This module therefore does **not create a database**. It has one job: take
+credentials that already exist and publish them into Secrets Manager using the
+envelope the application resolves at boot.
+
+That is still the graded piece. C3 is about the **runtime-injection path** — the
+app fetching its credentials at boot and never seeing them in code, an image, or
+user-data. Who provisions the engine is not what is being marked.
 
 ## Usage
 
@@ -9,111 +17,137 @@ Manager using the envelope the application expects.
 module "data" {
   source = "git::https://github.com/mercykilonzo/regional-health-platform.git//modules/data?ref=v0.1.0"
 
-  identifier  = "regional-health-mysql"
-  db_name     = "capacity_lab"
-  db_username = "app"
-  tags        = { Project = "regional-health", Owner = "mercy" }
+  db_host = var.db_host      # from TF_VAR_db_host
+  db_port = var.db_port      # Aiven-assigned high port, NOT 3306
+  db_name = var.db_name
+
+  db_username = var.db_username   # avnadmin
+  db_password = var.db_password    # from TF_VAR_db_password, sensitive
+
+  tags = { Project = "regional-health", Owner = "mercy" }
 }
 ```
 
-Pin `?ref=` to a **tag or commit SHA**, never a branch. Same supply-chain
-discipline C5 grades on actions and base images, applied to our own modules —
-and it stops a mid-flight commit on `main` silently changing someone's deploy.
+Pin `?ref=` to a **tag or commit SHA**, never a branch — a teammate's next commit
+would otherwise silently change what your root deploys.
+
+## Where the credentials come from
+
+```
+Aiven service page
+      │  host · port · user (avnadmin) · password
+      ▼
+GitHub Actions secrets  (and your local shell for manual applies)
+      │  TF_VAR_db_host, TF_VAR_db_port, TF_VAR_db_username, TF_VAR_db_password
+      ▼
+this module
+      │  jsonencode -> secret_string
+      ▼
+Secrets Manager  ──ARN only──▶  user-data  ──▶  app calls GetSecretValue at boot
+```
+
+**Never** a committed `.tfvars`. `*.tfvars` is gitignored specifically because it
+is the likeliest place for someone to park these values.
 
 ## Inputs
 
 | Name | Type | Default | Notes |
 |---|---|---|---|
-| `identifier` | string | `regional-health-mysql` | Distinct per caller |
-| `db_name` | string | `capacity_lab` | Initial database |
-| `db_username` | string | `app` | Validated against RDS reserved names |
-| `instance_class` | string | `db.t3.micro` | 2 vCPU / 1 GiB |
-| `allocated_storage` | number | `20` | GiB; validated `>= 20` |
-| `engine_version` | string | `8.0` | |
+| `db_host` | string | **required** | No default — a default credential is worse than a missing one |
+| `db_port` | number | **required** | Aiven assigns a high port; assuming 3306 will fail |
+| `db_username` | string | `avnadmin` | Aiven's default |
+| `db_password` | string | **required**, `sensitive` | From Aiven, never generated here |
+| `db_name` | string | `defaultdb` | Aiven's default database |
 | `secret_name` | string | `regional-health/db` | |
-| `multi_az` | bool | `false` | See trade-off below |
-| `storage_encrypted` | bool | `true` | LocalStack echoes, does not apply |
-| `backup_retention_period` | number | `7` | Satisfies `trivy config` |
-| `deletion_protection` | bool | `false` | Lab requires destroy; see below |
 | `kms_key_id` | string | `null` | AWS-managed key if unset |
 | `tags` | map(string) | `{}` | |
+
+Host, port and password have **no defaults on purpose**. A missing value fails
+loudly at plan time; a defaulted one fails mysteriously at boot.
 
 ## Outputs
 
 `db_endpoint` · `db_port` · `db_name` · `db_username` · `secret_arn` ·
 `secret_name` · `secret_version_id`
 
-**There is no `db_password` output, by design.** Exposing it would copy the
-value into the caller's state, into `terraform output`, and into any CI log that
-prints outputs. Consumers receive the **ARN** and resolve the value themselves
-at runtime via `GetSecretValue`.
+**No `db_password` output**, by design. Exposing it would copy the value into the
+caller's state, into `terraform output`, and into any CI step that echoes
+outputs. Terraform would mark it sensitive and still write it to all three.
 
-## Right-sizing rationale
-
-| Choice | Value | Why |
-|---|---|---|
-| Instance class | `db.t3.micro` | 10,000 patients is a few MB. The dataset fits entirely in the buffer pool, so the smallest general-purpose class is not a compromise — it is correct. |
-| Storage | 20 GiB `gp3` | RDS-MySQL minimum. The data is a rounding error against it; provisioning more would be waste, not headroom. |
-| Engine | MySQL `8.0` | Matches Assignment 1, so InnoDB lock behaviour, `innodb_lock_wait_timeout` and connection limits reproduce faithfully — which is what makes the OPS-2202 and OPS-2203 replays meaningful rather than decorative. |
-| Multi-AZ | `false` | **Trade-off accepted:** losing the AZ loses the database. Recovery is bounded by restore-from-backup (minutes-to-hours) rather than failover (~60–120 s). Defensible for a lab; a real admissions system would not accept it. |
-| Backup retention | 7 days | Satisfies `trivy config` and is a defensible production floor. LocalStack takes no backups. |
-| Deletion protection | `false` | Graded evidence needs `terraform destroy` to succeed, and CI rebuilds from zero every run. **On production this must be `true`.** |
+`db_endpoint` is named for the host to keep the interface stable for roots
+written against the earlier RDS version.
 
 ## The credential envelope
-
-`aws_secretsmanager_secret_version` writes exactly:
 
 ```json
 {
   "engine":   "mysql",
-  "username": "app",
-  "password": "<generated>",
-  "host":     "<rds address>",
-  "port":     3306,
-  "dbname":   "capacity_lab"
+  "username": "avnadmin",
+  "password": "<from Aiven>",
+  "host":     "mysql-xxxx.a.aivencloud.com",
+  "port":     12345,
+  "dbname":   "defaultdb"
 }
 ```
 
-Those key names are the contract `api/secrets.js` parses. They deliberately
-match the shape AWS writes for RDS-managed secrets, so the application code
-would work unchanged against a real AWS account with `AWS_ENDPOINT_URL` unset.
+Keys are **exactly** those six. That is the contract `api/secrets.js` parses, and
+it matches the shape AWS writes for RDS-managed secrets — so the application is
+portable to a real AWS account with an RDS-managed secret and no code change.
+
+**The Aiven CA certificate is deliberately not in this envelope.** Aiven requires
+TLS, so the app needs the CA — but a CA certificate is a *public* certificate,
+not a credential. It travels with the image or via user-data. Adding a seventh
+key would break the contract the app and the grader both expect.
+
+*(Practical note: committing `aiven-ca.pem` is safe from a gitleaks perspective —
+its rules target `PRIVATE KEY` blocks, not `CERTIFICATE` blocks. Verify rather
+than assume, and if it does flag, use a `.gitleaksignore` entry with a stated
+reason rather than weakening the rule.)*
 
 ## Terraform state is a credential store
 
-`aws_db_instance.password` lands in state **in cleartext**. No arrangement of
-`random_password` avoids this — the provider needs the value to make the API
-call. The rule is therefore:
+`var.db_password` is marked `sensitive`, which keeps it out of plan output and CLI
+logs. **It does not keep it out of state** — the provider must store the value it
+sent to the API. Identical discipline to the RDS version:
 
 - no plaintext secret in git or in the image;
-- the state backend is treated as a credential store: **encrypted, versioned,
-  non-public, gitignored**;
+- the state backend is encrypted, versioned, non-public, gitignored;
 - `trivy config` proves those bucket properties.
+
+## What this module cannot verify
+
+It writes credentials; it does not test them. A wrong password produces a
+perfectly valid secret and a `/readyz` that returns 503 at boot — which is the
+correct behaviour and exactly the C4 evidence, but worth knowing when debugging.
+
+**Aiven's free tier sleeps when idle.** A cold service refuses connections until
+it wakes, which looks identical to a bad credential. Hit the service once before
+you start working, and check that before blaming this module.
+
+## Free-tier limits (Aiven)
+
+| Limit | Value | Relevance |
+|---|---|---|
+| Services | 1 MySQL per account | Use your **own personal** account; do not share |
+| Storage | 1 GB | 10,000 patients is a few MB |
+| Connections | 76 | Matters for the OPS-2202 replay: pool sizing must stay under this ceiling, which is a real constraint the local container never had |
+
+That connection ceiling is worth carrying into the incident replay. In
+Assignment 1 the pool was bounded only by what MySQL was configured to accept;
+here there is a hard external limit, so a pool sized without regard to it will
+fail with a connection error rather than queue.
 
 ## LocalStack fidelity notes
 
 Carry these into `FIDELITY.md` **with your own detection method** — the brief
-grades how you detected the divergence, not the list itself.
+grades how you detected the divergence, not the list.
 
 | Declared | What LocalStack appears to do |
 |---|---|
-| `storage_encrypted = true` | Returned as configured; no encryption applied |
-| `backup_retention_period = 7` | No automated backups taken |
-| `enabled_cloudwatch_logs_exports` | Accepted; nothing shipped to CloudWatch |
-| `publicly_accessible = false` | Governs nothing — reachable over the Docker bridge either way |
-| `kms_key_id` | Accepted; no CMK enforcement |
+| `kms_key_id` on the secret | Accepted; no CMK enforcement observed |
+| `recovery_window_in_days = 0` | Behaviour around soft-delete differs from real AWS |
 
-Also note: the endpoint RDS returns is on `localhost:<port>`. From **inside**
-the EC2 instance container, `localhost` is the instance itself — use the bridge
-address or `localhost.localstack.cloud`. This is the first of the assignment's
-"four things that will break first".
-
-## Lifecycle notes
-
-- **`ignore_changes = [password]`** on the instance: rotation happens through
-  Secrets Manager, not by re-applying this resource. Without it, any change to
-  `random_password` forces an in-place master-password reset and desyncs the
-  secret from the database.
-- **`recovery_window_in_days = 0`** on the secret: the 30-day default
-  soft-delete holds the secret *name* for 30 days, so the next `make up` fails
-  with `InvalidRequestException`. Correct for a lab that rebuilds constantly; on
-  production you want the recovery window.
+Note that the *database* is no longer emulated at all — Aiven is a real MySQL
+server over TLS. Lock waits, InnoDB behaviour and connection limits are genuine,
+which makes the OPS-2202 and OPS-2203 replays more faithful than they would have
+been on emulated RDS.
