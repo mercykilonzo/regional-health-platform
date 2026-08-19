@@ -1,0 +1,37 @@
+# =============================================================================
+# Platform repo CI
+#
+# This repo holds Terraform modules and the golden pipeline — no application, no
+# Dockerfile. So it calls the golden pipeline in scan-only mode: the three gates
+# run against this repo's own PRs, but the build and deploy stages are skipped.
+#
+# Two reasons this matters rather than being ceremony:
+#   1. `trivy config` scans the modules we ship. A misconfiguration here is
+#      inherited by every engineer who consumes the module, so catching it at
+#      PR time is worth more than catching it in one person's root.
+#   2. `zizmor` audits golden-pipeline.yml itself. The pipeline we hand to
+#      everyone else has to pass the same gate it enforces on them.
+#
+# No secrets are passed. There is nothing here to deploy, so the deploy job that
+# would need the LocalStack token never runs.
+# =============================================================================
+
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  gates:
+    name: scan gates
+    uses: ./.github/workflows/golden-pipeline.yml
+    permissions:
+      contents: read
+    with:
+      run_build: false
+      run_deploy: false

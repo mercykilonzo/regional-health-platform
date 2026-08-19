@@ -1,0 +1,393 @@
+# =============================================================================
+# Golden pipeline — reusable workflow                            (group-owned)
+#
+# Called by each engineer's individual repo. Order matches the assignment's
+# target architecture:
+#
+#   gitleaks -> trivy config -> zizmor -> docker build -> trivy image
+#                                                            |
+#                                      tag as localstack-ec2/app:ami-<sha12>
+#                                                            |
+#                                                      tflocal apply
+#
+# Every gate FAILS THE BUILD. A scanner that runs but never blocks is theatre.
+#
+# --- Supply-chain posture (C5: "guard the guards") --------------------------
+# Pinning is necessary but NOT sufficient. It does not stop a malicious commit
+# already at the pinned SHA, a compromised maintainer, or a zero-day in the
+# tool's own logic. So this workflow layers three things:
+#
+#   Integrity  — every action pinned to a full commit SHA, never a tag. Tags
+#                are mutable: in 2025 tj-actions/changed-files had its tags
+#                repointed to steal CI secrets from thousands of repos.
+#   Blast radius — scan jobs run with `permissions: contents: read` and are
+#                passed NO secrets. A compromised scanner cannot exfiltrate
+#                what the job never had.
+#   Detection  — step-security/harden-runner audits egress on every job, so a
+#                compromised step phoning home is visible after the fact. You
+#                cannot prevent an unknown zero-day; you contain and detect it.
+# =============================================================================
+
+name: golden-pipeline
+
+on:
+  workflow_call:
+    inputs:
+      terraform_dir:
+        description: "Directory holding the Terraform root to apply."
+        type: string
+        default: "terraform"
+      image_name:
+        description: "Local image name for the app before AMI tagging."
+        type: string
+        default: "capacity-api"
+      dockerfile:
+        description: "Path to the Dockerfile."
+        type: string
+        default: "api/Dockerfile"
+      docker_context:
+        description: "Build context for the image."
+        type: string
+        default: "api"
+      trivy_severity:
+        description: "Severities that fail the image scan."
+        type: string
+        default: "HIGH,CRITICAL"
+      run_build:
+        description: >-
+          Whether to build and scan the app image. False for repos with no
+          Dockerfile — the platform repo itself calls it this way so its own PRs
+          still run the three scan gates.
+        type: boolean
+        default: true
+      run_deploy:
+        description: "Whether to stand the stack up. Set false for scan-only runs."
+        type: boolean
+        default: true
+    secrets:
+      localstack_auth_token:
+        description: "LocalStack Hobby auth token. Only the deploy job receives this."
+        required: false
+
+# Deny by default at the workflow level; each job re-grants the minimum it needs.
+permissions: {}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # GATE 1 — secrets in the repo and its full history
+  #
+  # fetch-depth: 0 matters. The default shallow clone scans only the tip commit,
+  # so a credential committed and later "removed" stays in history and passes
+  # unnoticed. Full history is the whole point of this gate.
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    name: "gate: gitleaks (secrets)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No job here pushes to git, so the token has no reason to persist
+          # in .git/config where an artifact upload could carry it out.
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          # gitleaks-action is free for personal repos. GitHub *Organizations*
+          # require GITLEAKS_LICENSE; if this platform repo ever moves under an
+          # org, that becomes a required secret here.
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gitleaks-report
+          path: results.sarif
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # GATE 2 — Terraform and Dockerfile misconfiguration
+  #
+  # This is the gate that catches an 0.0.0.0/0 security group, an unencrypted
+  # bucket, or a container running as root.
+  # ---------------------------------------------------------------------------
+  iac-scan:
+    name: "gate: trivy config (IaC)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No job here pushes to git, so the token has no reason to persist
+          # in .git/config where an artifact upload could carry it out.
+          persist-credentials: false
+
+      - name: trivy config
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          # exit-code 1 is what makes this a gate rather than a report.
+          exit-code: "1"
+          severity: ${{ inputs.trivy_severity }}
+          format: json
+          output: trivy-config.json
+          # trivyignores: .trivyignore  # documented exceptions only, each with a reason
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-config
+          path: trivy-config.json
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # GATE 3 — the workflows themselves
+  #
+  # zizmor catches unpinned action tags, dangerous `pull_request_target` usage,
+  # script injection via untrusted `github.event.*` interpolation, and
+  # over-broad permissions. It is the gate that audits this very file.
+  # ---------------------------------------------------------------------------
+  actions-scan:
+    name: "gate: zizmor (GitHub Actions)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No job here pushes to git, so the token has no reason to persist
+          # in .git/config where an artifact upload could carry it out.
+          persist-credentials: false
+
+      - name: zizmor
+        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+        with:
+          # Fail on anything medium or worse. Default only fails on high.
+          advanced-security: false
+          persona: regular
+          online-audits: false
+
+  # ---------------------------------------------------------------------------
+  # BUILD + GATE 4 — image vulnerabilities
+  #
+  # Gated behind all three scans: an image is not built from a tree that failed
+  # a secret, IaC, or workflow check.
+  # ---------------------------------------------------------------------------
+  build-image:
+    name: "build + gate: trivy image"
+    if: ${{ inputs.run_build }}
+    needs: [secret-scan, iac-scan, actions-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      ami_tag: ${{ steps.ami.outputs.tag }}
+      image_digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No job here pushes to git, so the token has no reason to persist
+          # in .git/config where an artifact upload could carry it out.
+          persist-credentials: false
+
+      # Inputs reach `run:` through the environment, never through ${{ }}
+      # interpolation. Interpolated expressions are substituted into the shell
+      # script before it executes, so a value containing shell metacharacters
+      # becomes code. Passing via env makes it data. zizmor's
+      # template-injection audit flags the interpolated form, and it is right to.
+      - name: Build image
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          BUILD_CONTEXT: ${{ inputs.docker_context }}
+        run: |
+          docker build -f "$DOCKERFILE" -t "${IMAGE_NAME}:${GITHUB_SHA}" "$BUILD_CONTEXT"
+
+      - name: Record image digest
+        id: digest
+        env:
+          IMAGE_NAME: ${{ inputs.image_name }}
+        run: |
+          # The digest is the immutable identity of what was scanned and
+          # deployed. A tag can be repointed; a digest cannot.
+          digest=$(docker image inspect "${IMAGE_NAME}:${GITHUB_SHA}" \
+                    --format '{{ index .RepoDigests 0 }}' 2>/dev/null \
+                    || docker image inspect "${IMAGE_NAME}:${GITHUB_SHA}" --format '{{ .Id }}')
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "${digest}" | tee image-digest.txt
+
+      - name: trivy image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: "${{ inputs.image_name }}:${{ github.sha }}"
+          exit-code: "1"
+          severity: ${{ inputs.trivy_severity }}
+          ignore-unfixed: true
+          format: json
+          output: trivy-image.json
+
+      - name: Tag as a LocalStack AMI
+        id: ami
+        env:
+          IMAGE_NAME: ${{ inputs.image_name }}
+        run: |
+          # LocalStack discovers Docker-backed AMIs by image tag, and the format
+          # is strict: localstack-ec2/<name>:ami-<exactly 12 hex chars>.
+          # Getting this wrong is the assignment's second "thing that will break
+          # first" -- it surfaces as InvalidAMIID.NotFound at apply time, which
+          # points at Terraform rather than at the tag.
+          sha12="${GITHUB_SHA:0:12}"
+          tag="localstack-ec2/app:ami-${sha12}"
+          docker tag "${IMAGE_NAME}:${GITHUB_SHA}" "${tag}"
+          echo "tag=ami-${sha12}" >> "$GITHUB_OUTPUT"
+          echo "Tagged ${tag}"
+
+      - name: Save image for the deploy job
+        run: docker save "localstack-ec2/app:ami-${GITHUB_SHA:0:12}" -o app-ami.tar
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-and-scan
+          path: |
+            app-ami.tar
+            trivy-image.json
+            image-digest.txt
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # DEPLOY — LocalStack runs INSIDE this runner (in-runner mode).
+  #
+  # Deliberately NOT a hosted/ephemeral Cloud Sandbox: the app runs on nginx on
+  # a Docker-backed EC2 instance whose port is reachable only from the Linux
+  # host, so /readyz and the k6 replay have no path through a remote preview
+  # URL. Ephemeral minutes are also credit-metered and not on the Hobby tier.
+  #
+  # This is the ONLY job that receives the LocalStack token.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: "deploy: tflocal apply"
+    # Requires the build, so it can only run when both flags are on.
+    if: ${{ inputs.run_deploy && inputs.run_build }}
+    needs: build-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No job here pushes to git, so the token has no reason to persist
+          # in .git/config where an artifact upload could carry it out.
+          persist-credentials: false
+
+      - name: Download image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image-and-scan
+
+      - name: Load AMI image
+        run: |
+          docker load -i app-ami.tar
+          docker images | grep localstack-ec2 || (echo "AMI image missing after load" && exit 1)
+
+      - name: Start LocalStack (in-runner)
+        uses: LocalStack/setup-localstack@7c8a0cb3405bc58be4c8f763f812aa000bc46303 # v0.3.2
+        with:
+          image-tag: latest
+          use-pro: true
+          install-awslocal: true
+          configuration: |
+            DEBUG=1
+            EC2_DOCKER_FLAGS=--memory=512m
+        env:
+          # The cgroup ceiling above is what makes the OPS-2204 OOM reproducible:
+          # small enough to fail under the unbounded export, large enough for
+          # normal traffic.
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.localstack_auth_token }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - name: Install tflocal
+        run: pip install --no-cache-dir terraform-local
+
+      - name: Terraform fmt / validate
+        working-directory: ${{ inputs.terraform_dir }}
+        run: |
+          terraform fmt -check -recursive
+          tflocal init -input=false
+          terraform validate
+
+      - name: Apply
+        working-directory: ${{ inputs.terraform_dir }}
+        env:
+          TF_VAR_app_ami_id: ${{ needs.build-image.outputs.ami_tag }}
+        run: tflocal apply -auto-approve -input=false | tee apply.log
+
+      - name: Plan must be empty after apply
+        working-directory: ${{ inputs.terraform_dir }}
+        env:
+          TF_VAR_app_ami_id: ${{ needs.build-image.outputs.ami_tag }}
+        run: |
+          # An idempotent apply is the real test of C1. A non-empty plan here
+          # means a resource is being recreated on every run, which would make
+          # the whole stack non-reproducible.
+          tflocal plan -detailed-exitcode -input=false | tee plan-after-apply.txt
+          # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes present
+          code=${PIPESTATUS[0]}
+          if [ "$code" = "2" ]; then
+            echo "::error::terraform plan is NOT empty after apply -- the stack is not idempotent"
+            exit 1
+          fi
+          exit "$code"
+
+      - name: Upload IaC evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: iac-evidence
+          path: |
+            ${{ inputs.terraform_dir }}/apply.log
+            ${{ inputs.terraform_dir }}/plan-after-apply.txt
+          if-no-files-found: ignore
