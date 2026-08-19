@@ -118,11 +118,12 @@ resource "aws_security_group" "instance" {
 # -----------------------------------------------------------------------------
 resource "aws_instance" "service" {
   ami                    = var.app_ami_id
-  instance_type          = "t3.small"
+  instance_type          = var.instance_type
   vpc_security_group_ids = [aws_security_group.instance.id]
 
   user_data = templatefile("${path.module}/templates/user-data.sh.tpl", {
     secret_arn   = var.secret_arn
+    db_endpoint  = var.db_endpoint
     db_port      = var.db_port
     db_name      = var.db_name
     app_port     = var.app_port
